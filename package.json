@@ -12,6 +12,7 @@
   "dependencies": {
     "@ai-sdk/google": "^4.0.95",
     "@ai-sdk/openai": "^4.0.92",
+    "@ai-sdk/react": "^4.0.143",
     "@base-ui/react": "^1.9.0",
     "@google/genai": "^2.29.0",
     "@langchain/community": "^1.1.29",

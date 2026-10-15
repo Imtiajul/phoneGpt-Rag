@@ -21,9 +21,11 @@ if (!apiKey) {
 
 const google = createGoogleGenerativeAI({ apiKey });
 
+// Optimized chunk size to preserve semantic context while keeping
+// total requests safely within the 1000 requests/day free tier quota.
 const splitter = new RecursiveCharacterTextSplitter({
-  chunkSize: 512,
-  chunkOverlap: 100,
+  chunkSize: 1200,
+  chunkOverlap: 150,
 });
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -35,12 +37,35 @@ const scrapePage = async (url: string): Promise<string> => {
     },
     gotoOptions: {
       waitUntil: "domcontentloaded",
+      timeout: 30000,
     },
   });
   return (await loader.scrape()).replace(/<[^>]*>?/gm, "");
 };
 
-// Embed with automatic retry and exponential backoff for 429 rate limits
+function isRateLimitError(err: any): boolean {
+  const fullErrorText = (
+    String(err?.message || "") +
+    " " +
+    String(err?.cause || "") +
+    " " +
+    JSON.stringify(err?.lastError || "") +
+    " " +
+    JSON.stringify(err?.errors || "")
+  ).toLowerCase();
+
+  return (
+    err?.statusCode === 429 ||
+    err?.status === 429 ||
+    err?.lastError?.statusCode === 429 ||
+    fullErrorText.includes("429") ||
+    fullErrorText.includes("resource_exhausted") ||
+    fullErrorText.includes("rate limit") ||
+    fullErrorText.includes("quota")
+  );
+}
+
+// Embed with automatic retry and exponential backoff
 async function embedBatchWithRetry(
   values: string[],
   retries = 5
@@ -48,7 +73,7 @@ async function embedBatchWithRetry(
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const { embeddings } = await embedMany({
-        model: google.textEmbeddingModel("gemini-embedding-2"),
+        model: google.textEmbeddingModel("gemini-embedding-001"),
         values,
         providerOptions: {
           google: {
@@ -58,17 +83,11 @@ async function embedBatchWithRetry(
       });
       return embeddings;
     } catch (err: any) {
-      const isRateLimit =
-        err?.statusCode === 429 ||
-        err?.message?.includes("429") ||
-        err?.message?.includes("quota") ||
-        err?.message?.includes("RESOURCE_EXHAUSTED");
-
-      if (isRateLimit && attempt < retries) {
-        // Retry backoff: 25s, 45s, 65s...
-        const waitMs = 25000 + (attempt - 1) * 20000;
+      if (isRateLimitError(err) && attempt < retries) {
+        // Backoff: 30s, 40s, 50s... to allow the free-tier 1-minute RPM window to reset
+        const waitMs = 20000 + attempt * 10000;
         console.warn(
-          `⚠️ Rate limit reached (429). Waiting ${waitMs / 1000}s before retry (attempt ${attempt}/${retries})...`
+          `⚠️ Rate limit encountered. Pausing for ${waitMs / 1000}s to reset RPM quota (attempt ${attempt}/${retries})...`
         );
         await sleep(waitMs);
       } else {
@@ -76,54 +95,94 @@ async function embedBatchWithRetry(
       }
     }
   }
-  throw new Error("Failed to embed batch after multiple retries.");
+  throw new Error("Failed to embed batch after retries.");
 }
 
-const BATCH_SIZE = 25;
+const BATCH_SIZE = 10;
+// 4500ms delay between batches stays comfortably under the Gemini 15 RPM free tier limit
+const DELAY_BETWEEN_BATCHES_MS = 4500;
+
+// Set --force flag via CLI (e.g. npm run seed -- --force) to force re-seeding existing URLs
+const FORCE_RESEED = process.argv.includes("--force");
 
 const loadData = async (webpages: string[]) => {
+  let totalSaved = 0;
+  let totalSkipped = 0;
+  const now = new Date().toISOString();
+
+  if (FORCE_RESEED) {
+    console.log("⚡ --force flag detected. Existing pages will be re-scraped and updated.");
+  }
+
   for (const url of webpages) {
-    console.log(`\n========================================`);
-    console.log(`Scraping: ${url}`);
-    console.log(`========================================`);
+    try {
+      // Option 1 check: If URL already has chunks in Supabase, skip to save free-tier quota
+      if (!FORCE_RESEED) {
+        const { count, error } = await supabase
+          .from("chunks")
+          .select("*", { count: "exact", head: true })
+          .eq("url", url);
 
-    const content = await scrapePage(url);
-    const chunks = await splitter.splitText(content);
-    console.log(`Generated ${chunks.length} chunks for ${url}`);
-
-    // Remove existing chunks for this URL so re-running is idempotent and avoids duplicates
-    await supabase.from("chunks").delete().eq("url", url);
-
-    // Process chunks in batches of 25 to respect Gemini free-tier RPM limits
-    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-      const batchChunks = chunks.slice(i, i + BATCH_SIZE);
-      const start = i + 1;
-      const end = Math.min(i + BATCH_SIZE, chunks.length);
-
-      console.log(`Embedding chunks ${start}-${end} of ${chunks.length}...`);
-
-      const embeddings = await embedBatchWithRetry(batchChunks);
-
-      const rows = batchChunks.map((chunk, idx) => ({
-        content: chunk,
-        vector: embeddings[idx],
-        url: url,
-      }));
-
-      const { error } = await supabase.from("chunks").insert(rows);
-
-      if (error) {
-        console.error(`Error inserting batch ${start}-${end}:`, error);
-      } else {
-        console.log(`Saved batch ${start}-${end} to Supabase.`);
+        if (!error && count && count > 0) {
+          console.log(
+            `⏩ Skipping: ${url}\n   Already seeded (${count} chunks exist in Supabase). Use --force to re-seed.`
+          );
+          totalSkipped++;
+          continue;
+        }
       }
 
-      // Small delay between batches to stay comfortably within the 100 RPM quota
-      await sleep(1500);
-    }
+      console.log(`\n========================================`);
+      console.log(`Scraping: ${url}`);
+      console.log(`========================================`);
 
-    console.log(`Finished processing: ${url}`);
+      const content = await scrapePage(url);
+      const chunks = await splitter.splitText(content);
+      console.log(`Generated ${chunks.length} chunks for ${url}`);
+
+      // Delete existing chunks for this URL so re-running is idempotent and clean
+      await supabase.from("chunks").delete().eq("url", url);
+
+      for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+        const batchChunks = chunks.slice(i, i + BATCH_SIZE);
+        const start = i + 1;
+        const end = Math.min(i + BATCH_SIZE, chunks.length);
+
+        console.log(`Embedding chunks ${start}-${end} of ${chunks.length}...`);
+
+        const embeddings = await embedBatchWithRetry(batchChunks);
+
+        const rows = batchChunks.map((chunk, idx) => ({
+          content: chunk,
+          vector: embeddings[idx],
+          url: url,
+          date_updated: now,
+        }));
+
+        const { error } = await supabase.from("chunks").insert(rows);
+
+        if (error) {
+          console.error(`Error inserting batch ${start}-${end}:`, error);
+        } else {
+          console.log(`Saved batch ${start}-${end} to Supabase.`);
+          totalSaved += rows.length;
+        }
+
+        // Delay between batches to stay under 15 RPM
+        await sleep(DELAY_BETWEEN_BATCHES_MS);
+      }
+
+      console.log(`Finished processing: ${url}`);
+    } catch (urlErr) {
+      console.error(`❌ Failed processing URL ${url}:`, urlErr);
+    }
   }
+
+  console.log(`\n========================================`);
+  console.log(`Seeding summary:`);
+  console.log(`- New chunks saved: ${totalSaved}`);
+  console.log(`- Webpages skipped (already seeded): ${totalSkipped}`);
+  console.log(`========================================`);
 };
 
 loadData([

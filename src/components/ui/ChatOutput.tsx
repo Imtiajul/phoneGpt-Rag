@@ -1,22 +1,27 @@
-import { Message } from "ai";
+import { UIMessage, isTextUIPart } from "ai";
 import ReactMarkdown from "react-markdown";
 
 const ChatOutput = ({
   messages,
   status,
 }: {
-  messages: Message[];
+  messages: UIMessage[];
   status: string;
 }) => {
   return (
     <>
-      {messages.map((message, index) =>
-        message.role === "user" ? (
-          <UserChat key={index} content={message.content} />
+      {messages.map((message, index) => {
+        const content = message.parts
+          .filter(isTextUIPart)
+          .map((part) => part.text)
+          .join("");
+
+        return message.role === "user" ? (
+          <UserChat key={message.id ?? index} content={content} />
         ) : (
-          <AssistantChat key={index} content={message.content} />
-        )
-      )}
+          <AssistantChat key={message.id ?? index} content={content} />
+        );
+      })}
       {status === "submitted" && (
         <div className="text-muted-foreground">Generating response...</div>
       )}

@@ -15,16 +15,16 @@ export default function ChatInput({
     handleSubmit,
 }: ChatInputProps) {
     return (
-        <form onSubmit= { handleSubmit } className = "flex gap-2" >
+        <form onSubmit={handleSubmit} className="flex gap-2" >
             <Input
-        onChange={ handleInputChange }
-    value = { input }
-    placeholder = "Ask me something..."
-        />
-        <Button type="submit" >
-            <ArrowUp />
-            < span className = "sr-only" > Submit </span>
-                </Button>
-                </form>
-  );
+                onChange={handleInputChange}
+                value={input}
+                placeholder="Ask me something..."
+            />
+            <Button type="submit" >
+                <ArrowUp />
+                < span className="sr-only" > Submit </span>
+            </Button>
+        </form>
+    );
 }
